@@ -1,14 +1,16 @@
 import argparse
 import os
 import csv
+import pandas as pd
+import yaml
 
 # Notes
 """
 A script to generate the Basic data QC for Genomic Review Reports
 This script works with various trials and includes optional argument flags in case of weird naming conventions.
 
-Author: Evelyn Schmidt
-Date: August 2023
+Author: Evelyn Schmidt and Kelsy Cotto
+Date: Original August 2023; Updated Jan 2026
 """
 
 # ---- PARSE ARGUMENTS -------------------------------------------------------
@@ -125,20 +127,126 @@ def get_read_pairs(normal_dna, tumor_dna, tumor_rna):
     return read_pairs_report_string
 
 # ---- SAMPLE RELATEDNESS ----------------------------------------------------
-def get_relatedness(concordance):
-    """Checks Somalier results for sample tumor/normal sample relatedness."""
-    try:
-        with open(concordance, 'r') as file:
-            reader = csv.DictReader(file, delimiter='\t')
-            for row in reader:
-                relatedness = float(row['relatedness'])
-                evaluation = evaluate_relatedness(relatedness)
-                break
-            print('Relatedness:', relatedness, "(", evaluation, ")")
-            return "Relatedness: " + str(relatedness) + " (" + evaluation + ")\n"
-    except FileNotFoundError:
-        print(f"File {concordance} not found.")
-        return ""
+
+
+def get_sample_names_from_yaml(yaml_path: str) -> dict:
+    """
+    Returns dict with keys:
+      normal_dna, tumor_dna, tumor_rna (if present)
+    """
+    with open(yaml_path, "r") as f:
+        y = yaml.safe_load(f)
+
+    names = {}
+
+    if "immuno.normal_sample_name" in y:
+        names["normal_dna"] = y["immuno.normal_sample_name"]
+
+    if "immuno.tumor_sample_name" in y:
+        names["tumor_dna"] = y["immuno.tumor_sample_name"]
+
+    # RNA sample name key differs slightly
+    if "immuno.sample_name" in y:
+        names["tumor_rna"] = y["immuno.sample_name"]
+
+    return names
+
+
+def resolve_concordance_path(WB: str, final_result: str, concordance_arg: str | None) -> tuple[str, str]:
+    """
+    Returns (path, mode) where mode is 'threeway' or 'twoway'.
+    Prefers threeway if present, otherwise twoway. If user supplies a path, use it.
+    """
+    if concordance_arg:
+        return os.path.expanduser(concordance_arg), "user"
+
+    WB = os.path.expanduser(WB)
+
+    p_threeway = os.path.join(WB, final_result, "qc", "concordanceThreeway", "concordance.somalier.pairs.tsv")
+    p_twoway   = os.path.join(WB, final_result, "qc", "concordance",        "concordance.somalier.pairs.tsv")
+
+    if os.path.isfile(p_threeway):
+        return p_threeway, "threeway"
+    if os.path.isfile(p_twoway):
+        return p_twoway, "twoway"
+
+    # Return the expected threeway path for a clearer error message downstream
+    return p_threeway, "missing"
+
+
+def _quality_label(r: float) -> str:
+    if pd.isna(r):
+        return "missing"
+    if r >= 0.99:
+        return "excellent"
+    if r >= 0.95:
+        return "good"
+    if r >= 0.90:
+        return "ok"
+    return "poor"
+
+
+def _fmt_r(r: float) -> str:
+    if pd.isna(r):
+        return "NA"
+    if abs(r - 1.0) < 5e-4:
+        return "1"
+    return f"{r:.3f}"
+
+
+def _normalize_pairs_df(df: pd.DataFrame) -> pd.DataFrame:
+    # somalier sometimes uses "#sample_a"
+    if "#sample_a" in df.columns and "sample_a" not in df.columns:
+        df = df.rename(columns={"#sample_a": "sample_a"})
+    return df
+
+
+def _get_relatedness(df: pd.DataFrame, a: str, b: str) -> float:
+    hit = df.loc[
+        ((df["sample_a"] == a) & (df["sample_b"] == b)) |
+        ((df["sample_a"] == b) & (df["sample_b"] == a))
+    ]
+    if hit.empty:
+        return float("nan")
+    return float(hit["relatedness"].max())
+
+
+def concordance_report_lines(concordance_tsv: str, sample_names: dict) -> list[str]:
+    """
+    Backwards compatible:
+      - If tumor RNA is present in pairs, report 3-way metrics
+      - Else report tumor DNA / normal DNA only
+    Assumes naming contains: normalexome, tumorexome, tumorna
+    (tweak keys here if your naming differs)
+    """
+    df = pd.read_csv(concordance_tsv, sep="\t")
+    df = _normalize_pairs_df(df)
+
+    n = sample_names.get("normal_dna")
+    t = sample_names.get("tumor_dna")
+    r = sample_names.get("tumor_rna")
+
+    lines = []
+
+    if n and t:
+        r_tn = _get_relatedness(df, t, n)
+        lines.append(
+            f"Tumor DNA/Normal DNA sample relatedness = {_fmt_r(r_tn)} ({_quality_label(r_tn)})"
+        )
+
+    if n and r:
+        r_nr = _get_relatedness(df, n, r)
+        lines.append(
+            f"Normal DNA/Tumor RNA sample relatedness = {_fmt_r(r_nr)} ({_quality_label(r_nr)})"
+        )
+
+    if t and r:
+        r_tr = _get_relatedness(df, t, r)
+        lines.append(
+            f"Tumor DNA/Tumor RNA sample relatedness = {_fmt_r(r_tr)} ({_quality_label(r_tr)})"
+        )
+
+    return lines
 
 # ---- CONTAMINATION ---------------------------------------------------------
 def get_contamination(contamination_normal, contamination_tumor):
@@ -238,32 +346,45 @@ def get_variant_count(final_variants):
 def main():
     args = parse_arguments()
 
-    final_result = f"/{args.fin_results}" if args.fin_results else '/final_results'
+    WB = os.path.expanduser(args.WB) if args.WB else None
+    final_result = args.fin_results if args.fin_results else "final_results"
 
-    normal_dna = args.n_dna if args.n_dna else f"{args.WB}{final_result}/qc/fda_metrics/aligned_normal_dna/table_metrics/normal_dna_aligned_metrics.txt"
-    tumor_dna = args.t_dna if args.t_dna else f"{args.WB}{final_result}/qc/fda_metrics/aligned_tumor_dna/table_metrics/tumor_dna_aligned_metrics.txt"
-    tumor_rna = args.t_rna if args.t_rna else f"{args.WB}{final_result}/qc/fda_metrics/aligned_tumor_rna/table_metrics/tumor_rna_aligned_metrics.txt"
-    concordance = args.concordance if args.concordance else f"{args.WB}{final_result}/qc/concordance/concordance.somalier.pairs.tsv"
-    contamination_normal = args.contam_n if args.contam_n else f"{args.WB}{final_result}/qc/normal_dna/normal.VerifyBamId.selfSM"
-    contamination_tumor = args.contam_t if args.contam_t else f"{args.WB}{final_result}/qc/tumor_dna/tumor.VerifyBamId.selfSM"
-    rna_metrics = args.rna_metrics if args.rna_metrics else f"{args.WB}{final_result}/qc/tumor_rna/rna_metrics.txt"
-    strandness_check = args.strand_check if args.strand_check else f"{args.WB}{final_result}/qc/tumor_rna/trimmed_read_1strandness_check.txt"
+    normal_dna = args.n_dna if args.n_dna else os.path.join(WB, final_result, "qc", "fda_metrics", "aligned_normal_dna", "table_metrics", "normal_dna_aligned_metrics.txt")
+    tumor_dna  = args.t_dna if args.t_dna else os.path.join(WB, final_result, "qc", "fda_metrics", "aligned_tumor_dna",  "table_metrics", "tumor_dna_aligned_metrics.txt")
+    tumor_rna  = args.t_rna if args.t_rna else os.path.join(WB, final_result, "qc", "fda_metrics", "aligned_tumor_rna",  "table_metrics", "tumor_rna_aligned_metrics.txt")
+    concordance, concordance_mode = resolve_concordance_path(WB, final_result, getattr(args, "concordance", None))
+    contamination_normal = args.contam_n if args.contam_n else os.path.join(WB, final_result, "qc", "normal_dna", "normal.VerifyBamId.selfSM")
+    contamination_tumor  = args.contam_t if args.contam_t else os.path.join(WB, final_result, "qc", "tumor_dna",  "tumor.VerifyBamId.selfSM")
+    rna_metrics          = args.rna_metrics if args.rna_metrics else os.path.join(WB, final_result, "qc", "tumor_rna", "rna_metrics.txt")
+    strandness_check     = args.strand_check if args.strand_check else os.path.join(WB, final_result, "qc", "tumor_rna", "trimmed_read_1strandness_check.txt")
+    final_variants       = args.fin_variants if args.fin_variants else os.path.join(WB, final_result, "variants.final.annotated.tsv") 
   
     # yaml is always in different place
     if args.yaml:
         yaml_file = args.yaml
+
+    sample_names = get_sample_names_from_yaml(yaml_file)
     
-    final_variants = args.fin_variants if args.fin_variants else f"{args.WB}{final_result}/variants.final.annotated.tsv"
+    final_variants = args.fin_variants if args.fin_variants else os.path.join(WB, final_result, "variants.final.annotated.tsv")
         
     # create a text file to store results
-    qc_file = open(args.WB + '/../manual_review/qc_file.txt', 'w') if args.WB else pen('qc_file.txt', 'w')
+    qc_file = open(args.WB + '/../manual_review/qc_file.txt', 'w') if args.WB else open('qc_file.txt', 'w')
        
 
     print()
     print()
 
+    # ---- Read pairs (prints internally)
     qc_file.write(get_read_pairs(normal_dna, tumor_dna, tumor_rna))
-    qc_file.write(get_relatedness(concordance))
+
+    # ---- Concordance (stdout + file, in order)
+    if concordance_mode != "missing" and os.path.isfile(concordance):
+        for line in concordance_report_lines(concordance, sample_names):
+            print(line)
+            qc_file.write(line + "\n")
+    else:
+        print("Concordance file missing")
+        qc_file.write("Concordance file missing\n")
     qc_file.write(get_contamination(contamination_normal, contamination_tumor))
     qc_file.write(get_rna_alignment(rna_metrics))
     qc_file.write(check_strand(strandness_check,  yaml_file))
